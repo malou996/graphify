@@ -7827,6 +7827,217 @@ def extract_elixir(path: Path) -> dict:
     return {"nodes": nodes, "edges": clean_edges, "raw_calls": raw_calls, "input_tokens": 0, "output_tokens": 0}
 
 
+# ── Erlang ────────────────────────────────────────────────────────────────────
+
+def extract_erlang(path: Path) -> dict:
+    """Extract modules, functions, includes, imports, and calls from an Erlang source file."""
+    try:
+        import tree_sitter_erlang as tserl
+        from tree_sitter import Language, Parser
+    except ImportError:
+        return {"nodes": [], "edges": [], "error": "tree_sitter_erlang not installed"}
+
+    try:
+        language = Language(tserl.language())
+        parser = Parser(language)
+        source = path.read_bytes()
+        tree = parser.parse(source)
+        root = tree.root_node
+    except Exception as e:
+        return {"nodes": [], "edges": [], "error": str(e)}
+
+    stem = _file_stem(path)
+    str_path = str(path)
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    seen_ids: set[str] = set()
+    function_bodies: list[tuple[str, Any]] = []
+
+    def add_node(nid: str, label: str, line: int) -> None:
+        if nid not in seen_ids:
+            seen_ids.add(nid)
+            nodes.append({"id": nid, "label": label, "file_type": "code",
+                          "source_file": str_path, "source_location": f"L{line}"})
+
+    def add_edge(src: str, tgt: str, relation: str, line: int,
+                 confidence: str = "EXTRACTED", weight: float = 1.0,
+                 context: str | None = None) -> None:
+        edge = {"source": src, "target": tgt, "relation": relation,
+                "confidence": confidence, "source_file": str_path,
+                "source_location": f"L{line}", "weight": weight}
+        if context:
+            edge["context"] = context
+        edges.append(edge)
+
+    file_nid = _make_id(str(path))
+    add_node(file_nid, path.name, 1)
+
+    module_nid: str | None = None
+    # function_name -> nid (for resolving local calls)
+    func_name_to_nid: dict[str, str] = {}
+
+    def _extract_name(node) -> str | None:
+        if node.type == "atom":
+            return source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
+        if node.type == "var":
+            return source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
+        return None
+
+    def _extract_string(node) -> str | None:
+        if node.type == "string":
+            raw = source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
+            return raw.strip('"')
+        return None
+
+    def walk(node) -> None:
+        nonlocal module_nid
+        t = node.type
+
+        if t == "module_attribute":
+            name_node = node.child_by_field_name("name")
+            if name_node:
+                mod_name = _extract_name(name_node)
+                if mod_name:
+                    line = node.start_point[0] + 1
+                    module_nid = _make_id(stem, mod_name)
+                    add_node(module_nid, mod_name, line)
+                    add_edge(file_nid, module_nid, "contains", line)
+            return
+
+        if t == "fun_decl":
+            clause_node = node.child_by_field_name("clause")
+            if clause_node and clause_node.type == "function_clause":
+                name_node = clause_node.child_by_field_name("name")
+                if name_node:
+                    func_name = _extract_name(name_node)
+                    if func_name:
+                        line = node.start_point[0] + 1
+                        container = module_nid or file_nid
+                        func_nid = _make_id(container, func_name)
+                        add_node(func_nid, f"{func_name}()", line)
+                        if module_nid:
+                            add_edge(module_nid, func_nid, "method", line)
+                        else:
+                            add_edge(file_nid, func_nid, "contains", line)
+                        func_name_to_nid[func_name] = func_nid
+                        body_node = clause_node.child_by_field_name("body")
+                        if body_node:
+                            function_bodies.append((func_nid, body_node))
+            return
+
+        if t == "pp_include":
+            file_node = node.child_by_field_name("file")
+            if file_node:
+                inc_path = _extract_string(file_node)
+                if not inc_path:
+                    for child in file_node.children:
+                        inc_path = _extract_string(child)
+                        if inc_path:
+                            break
+                if inc_path:
+                    tgt_nid = _make_id(inc_path)
+                    add_edge(file_nid, tgt_nid, "imports",
+                             node.start_point[0] + 1, context="import")
+            return
+
+        if t == "pp_include_lib":
+            file_node = node.child_by_field_name("file")
+            if file_node:
+                inc_path = _extract_string(file_node)
+                if not inc_path:
+                    for child in file_node.children:
+                        inc_path = _extract_string(child)
+                        if inc_path:
+                            break
+                if inc_path:
+                    tgt_nid = _make_id(inc_path)
+                    add_edge(file_nid, tgt_nid, "imports",
+                             node.start_point[0] + 1, context="import")
+            return
+
+        if t == "import_attribute":
+            mod_node = node.child_by_field_name("module")
+            if mod_node:
+                mod_name = _extract_name(mod_node)
+                if mod_name:
+                    tgt_nid = _make_id(mod_name)
+                    add_edge(file_nid, tgt_nid, "imports",
+                             node.start_point[0] + 1, context="import")
+            return
+
+        for child in node.children:
+            if child.is_named:
+                walk(child)
+
+    walk(root)
+
+    label_to_nid: dict[str, str] = {}
+    for n in nodes:
+        normalised = n["label"].strip("()").lstrip(".")
+        label_to_nid[normalised] = n["id"]
+
+    seen_call_pairs: set[tuple[str, str]] = set()
+    raw_calls: list[dict] = []
+
+    def _get_call_name(node) -> tuple[str | None, bool]:
+        """Extract callee name from a call expression. Returns (name, is_remote)."""
+        expr_node = node.child_by_field_name("expr")
+        if expr_node is None:
+            return None, False
+
+        if expr_node.type == "remote":
+            mod_part = expr_node.child_by_field_name("module")
+            fun_part = expr_node.child_by_field_name("fun")
+            mod_name = None
+            if mod_part:
+                mod_child = mod_part.child_by_field_name("module")
+                if mod_child:
+                    mod_name = _extract_name(mod_child)
+            fun_name = None
+            if fun_part and fun_part.type == "call":
+                fn_name_node = fun_part.child_by_field_name("expr")
+                if fn_name_node:
+                    fun_name = _extract_name(fn_name_node)
+            return fun_name, True
+
+        name = _extract_name(expr_node)
+        return name, False
+
+    def walk_calls(node, caller_nid: str) -> None:
+        if node.type == "fun_decl":
+            return
+        if node.type == "call":
+            callee_name, is_remote = _get_call_name(node)
+            if callee_name and callee_name not in _LANGUAGE_BUILTIN_GLOBALS:
+                tgt_nid = label_to_nid.get(callee_name)
+                if tgt_nid and tgt_nid != caller_nid:
+                    pair = (caller_nid, tgt_nid)
+                    if pair not in seen_call_pairs:
+                        seen_call_pairs.add(pair)
+                        add_edge(caller_nid, tgt_nid, "calls",
+                                 node.start_point[0] + 1, confidence="EXTRACTED",
+                                 weight=1.0, context="call")
+                else:
+                    raw_calls.append({
+                        "caller_nid": caller_nid,
+                        "callee": callee_name,
+                        "is_member_call": is_remote,
+                        "source_file": str_path,
+                        "source_location": f"L{node.start_point[0] + 1}",
+                    })
+        for child in node.children:
+            if child.is_named:
+                walk_calls(child, caller_nid)
+
+    for caller_nid, body_node in function_bodies:
+        walk_calls(body_node, caller_nid)
+
+    clean_edges = [e for e in edges if e["source"] in seen_ids and
+                   (e["target"] in seen_ids or e["relation"] == "imports")]
+    return {"nodes": nodes, "edges": clean_edges, "raw_calls": raw_calls,
+            "input_tokens": 0, "output_tokens": 0}
+
+
 def extract_markdown(path: Path) -> dict:
     """Extract structural nodes and edges from a Markdown file.
 
@@ -10055,6 +10266,8 @@ _DISPATCH: dict[str, Any] = {
     ".ps1": extract_powershell,
     ".ex": extract_elixir,
     ".exs": extract_elixir,
+    ".erl": extract_erlang,
+    ".hrl": extract_erlang,
     ".m": extract_objc,
     ".mm": extract_objc,
     ".jl": extract_julia,

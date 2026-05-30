@@ -740,6 +740,61 @@ def test_elixir_method_edges():
     assert len(methods) >= 3
 
 
+# ── Erlang ────────────────────────────────────────────────────────────────────
+
+from graphify.extract import extract_erlang
+
+def test_erlang_no_error():
+    r = extract_erlang(FIXTURES / "sample.erl")
+    assert "error" not in r
+
+def test_erlang_finds_module():
+    r = extract_erlang(FIXTURES / "sample.erl")
+    labels = [n["label"] for n in r["nodes"]]
+    assert "sample" in labels
+
+def test_erlang_finds_functions():
+    r = extract_erlang(FIXTURES / "sample.erl")
+    labels = [n["label"] for n in r["nodes"]]
+    assert any("start" in l for l in labels)
+    assert any("process" in l for l in labels)
+    assert any("validate" in l for l in labels)
+    assert any("read_file" in l for l in labels)
+
+def test_erlang_finds_imports():
+    r = extract_erlang(FIXTURES / "sample.erl")
+    import_edges = [e for e in r["edges"] if e["relation"] == "imports"]
+    assert len(import_edges) >= 3
+
+def test_erlang_import_edges_have_import_context():
+    r = extract_erlang(FIXTURES / "sample.erl")
+    import_edges = _edges_with_relation(r, "imports")
+    assert import_edges
+    assert all(e.get("context") == "import" for e in import_edges)
+
+def test_erlang_finds_calls():
+    r = extract_erlang(FIXTURES / "sample.erl")
+    call_edges = [e for e in r["edges"] if e["relation"] == "calls"]
+    assert len(call_edges) >= 1
+
+def test_erlang_call_edges_have_call_context():
+    r = extract_erlang(FIXTURES / "sample.erl")
+    call_edges = _edges_with_relation(r, "calls")
+    assert call_edges
+    assert all(e.get("context") == "call" for e in call_edges)
+
+def test_erlang_method_edges():
+    r = extract_erlang(FIXTURES / "sample.erl")
+    methods = [e for e in r["edges"] if e["relation"] == "method"]
+    assert len(methods) >= 4
+
+def test_erlang_no_dangling_edges():
+    r = extract_erlang(FIXTURES / "sample.erl")
+    node_ids = {n["id"] for n in r["nodes"]}
+    for e in r["edges"]:
+        assert e["source"] in node_ids
+
+
 # ── Objective-C ──────────────────────────────────────────────────────────────
 from graphify.extract import extract_objc
 
